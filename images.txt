@@ -1,1 +1,3 @@
-fnsys/dockhand:latest
+redis:8-alpine
+postgres:18-alpine
+weishaw/sub2api:latest
