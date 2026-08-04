@@ -1,3 +1,1 @@
-redis:8-alpine
-postgres:18-alpine
-weishaw/sub2api:latest
+emqx/emqx:5.8.11
