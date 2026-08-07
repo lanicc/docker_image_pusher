@@ -1,1 +1,1 @@
-node:20-bookworm-slim
+alpine:3.22
