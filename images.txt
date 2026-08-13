@@ -1,1 +1,1 @@
-alpine:3.22
+motricseven7/snowluma:latest
