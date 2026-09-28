@@ -1,1 +1,1 @@
-sub2api
+weishaw/sub2api:latest
