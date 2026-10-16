@@ -1,1 +1,1 @@
-metacubex/mihomo:latest
+samanhappy/mcphub:latest
