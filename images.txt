@@ -1,1 +1,1 @@
-samanhappy/mcphub:latest
+samanhappy/mcphub:1.1.10
