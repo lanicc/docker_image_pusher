@@ -2,99 +2,246 @@ name: Docker
 
 on:
   workflow_dispatch:
+    inputs:
+      source_image:
+        description: "可选：同步单个源镜像；留空则读取 images.txt"
+        required: false
+        type: string
+      target_image:
+        description: "可选：目标仓库:标签，例如 mcphub:1.2.4"
+        required: false
+        type: string
+      platform:
+        description: "可选：指定 linux/amd64 等架构；留空保留所有可运行架构"
+        required: false
+        type: string
   push:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - images.txt
+      - .github/workflows/docker.yaml
 
-env:
-  ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
-  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
-  ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
-  ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Sync
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install skopeo
-        run: sudo apt-get update && sudo apt-get install -y skopeo
-
-      - name: Sync images to Aliyun
+      - name: Install Crane v0.22.1
+        shell: bash
         run: |
           set -euo pipefail
+          archive="$RUNNER_TEMP/crane.tar.gz"
+          curl --fail --show-error --location --retry 3 \
+            https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz \
+            --output "$archive"
+          echo "0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0  $archive" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/crane-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/crane-bin" crane
+          echo "$RUNNER_TEMP/crane-bin" >> "$GITHUB_PATH"
 
-          declare -A duplicate_images
-          declare -A temp_map
+      - name: Sync images to Aliyun
+        shell: python
+        env:
+          ALIYUN_REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+          ALIYUN_NAME_SPACE: ${{ secrets.ALIYUN_NAME_SPACE }}
+          ALIYUN_REGISTRY_USER: ${{ secrets.ALIYUN_REGISTRY_USER }}
+          ALIYUN_REGISTRY_PASSWORD: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+          SOURCE_REGISTRY: ${{ secrets.SOURCE_REGISTRY }}
+          SOURCE_USERNAME: ${{ secrets.SOURCE_USERNAME }}
+          SOURCE_PASSWORD: ${{ secrets.SOURCE_PASSWORD }}
+          SOURCE_IMAGE: ${{ inputs.source_image }}
+          TARGET_IMAGE: ${{ inputs.target_image }}
+          IMAGE_PLATFORM: ${{ inputs.platform }}
+        run: |
+          import collections
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shlex
+          import subprocess
+          import tempfile
+          import time
 
-          while IFS= read -r line || [ -n "$line" ]; do
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
 
-            image=$(echo "$line" | awk '{print $NF}')
-            image="${image%%@*}"
+          def crane(*args, capture=False):
+              for attempt in range(3):
+                  try:
+                      return subprocess.run(
+                          ["crane", *args], check=True, text=True,
+                          stdout=subprocess.PIPE if capture else None,
+                      ).stdout
+                  except subprocess.CalledProcessError:
+                      if attempt == 2:
+                          raise
+                      print(f"Retrying registry operation ({attempt + 1}/2)...", flush=True)
+                      time.sleep(5 * (attempt + 1))
 
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            name_space="${name_space}_"
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
 
-            if [[ -n "${temp_map[$image_name]:-}" ]]; then
-              if [[ "${temp_map[$image_name]}" != "$name_space" ]]; then
-                duplicate_images[$image_name]="true"
-              fi
-            else
-              temp_map[$image_name]="$name_space"
-            fi
-          done < images.txt
+          def parse_line(line):
+              tokens = shlex.split(line, comments=True)
+              if not tokens:
+                  return None
+              platform = ""
+              if tokens[0].startswith("--platform="):
+                  platform = tokens.pop(0).split("=", 1)[1]
+              elif tokens[0] == "--platform" and len(tokens) >= 3:
+                  tokens.pop(0)
+                  platform = tokens.pop(0)
+              if len(tokens) != 1 or tokens[0].startswith("-"):
+                  raise ValueError(f"Invalid images.txt entry: {line}")
+              return tokens[0], platform
 
-          while IFS= read -r line || [ -n "$line" ]; do
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
 
-            platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
-            image=$(echo "$line" | awk '{print $NF}')
-            image="${image%%@*}"
+          def image_details(image, platform):
+              image = image.removeprefix("docker://")
+              if not image or "://" in image or any(c.isspace() for c in image):
+                  raise ValueError(f"Invalid source image: {image}")
+              if platform and not re.fullmatch(r"[a-z0-9_-]+/[a-z0-9_-]+(?:/[a-z0-9_-]+)?", platform):
+                  raise ValueError(f"Invalid platform: {platform}; use os/arch[/variant]")
+              name, separator, digest = image.partition("@")
+              if separator and not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
+                  raise ValueError(f"Invalid SHA256 digest: {image}")
+              parts = name.split("/")
+              if len(parts) == 1 or not any(c in parts[0] for c in ".:") and parts[0] != "localhost":
+                  parts.insert(0, "docker.io")
+              if parts[0] in ("index.docker.io", "registry-1.docker.io"):
+                  parts[0] = "docker.io"
+              if parts[0] == "docker.io" and len(parts) == 2:
+                  parts.insert(1, "library")
+              leaf = parts[-1]
+              if ":" in leaf:
+                  basename, tag = leaf.rsplit(":", 1)
+              else:
+                  basename = leaf
+                  tag = "sha256-" + digest.split(":", 1)[1] if digest else "latest"
+              parts[-1] = basename
+              repository = "/".join(parts)
+              source = f"{repository}@{digest}" if digest else f"{repository}:{tag}"
+              return dict(source=source, repository=repository, basename=basename,
+                          tag=tag, platform=platform, namespace="_".join(parts[1:-1]))
 
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
 
-            platform_prefix=""
-            if [ -n "$platform" ]; then
-              platform_prefix="${platform//\//_}_"
-            fi
+          def make_plan(entries, registry, namespace, target=""):
+              images = [image_details(*entry) for entry in entries]
+              repositories = collections.defaultdict(set)
+              for image in images:
+                  repositories[image["basename"]].add(image["repository"])
+              seen = {}
+              plan = []
+              for image in images:
+                  prefix = image["platform"].replace("/", "_") + "_" if image["platform"] else ""
+                  if len(repositories[image["basename"]]) > 1:
+                      prefix += image["namespace"] + "_"
+                  destination = target or f"{prefix}{image['basename']}:{image['tag']}"
+                  if ":" not in destination:
+                      destination += ":latest"
+                  if not re.fullmatch(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", destination):
+                      raise ValueError(f"Invalid target repository:tag: {destination}")
+                  image["destination"] = f"{registry}/{namespace}/{destination}"
+                  identity = (image["source"], image["platform"])
+                  if image["destination"] in seen:
+                      if seen[image["destination"]] != identity:
+                          raise ValueError(f"Conflicting sources for {destination}; sync separately with target_image")
+                      continue
+                  seen[image["destination"]] = identity
+                  plan.append(image)
+              if not plan:
+                  raise ValueError("No images to sync")
+              return plan
 
-            name_space_prefix=""
-            if [[ -n "${duplicate_images[$image_name]:-}" && -n "$name_space" ]]; then
-              name_space_prefix="${name_space}_"
-            fi
 
-            image_name_tag="${image_name_tag%%@*}"
-            new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${platform_prefix}${name_space_prefix}${image_name_tag}"
+          def sync_image(image):
+              source, destination = image["source"], image["destination"]
+              digest = source.split("@", 1)[1] if "@" in source else crane("digest", source, capture=True).strip()
+              source = f"{image['repository']}@{digest}"
+              manifest = json.loads(crane("manifest", source, capture=True))
+              platform = image["platform"]
+              print(f"Syncing {source} -> {destination}", flush=True)
+              if platform:
+                  if "manifests" not in manifest:
+                      config = json.loads(crane("config", source, capture=True))
+                      requested = platform.split("/")
+                      if requested[:2] != [config.get("os"), config.get("architecture")] or (
+                          len(requested) == 3 and requested[2] != config.get("variant")
+                      ):
+                          raise ValueError(f"Source image does not match platform {platform}")
+                  crane("copy", "--platform", platform, source, destination)
+                  return platform
+              if "manifests" not in manifest:
+                  crane("copy", source, destination)
+                  return "single architecture"
 
-            skopeo inspect --raw "docker://$image" | jq .
-            echo "skopeo copy docker://$image -> docker://$new_image"
+              # ACR may reject BuildKit attestations (unknown/unknown, OCI empty config).
+              # Keep runnable platforms and let Crane copy their layers and rebuild the index.
+              platforms = set()
+              for descriptor in manifest["manifests"]:
+                  p = descriptor.get("platform", {})
+                  annotations = descriptor.get("annotations", {})
+                  if annotations.get("vnd.docker.reference.type") == "attestation-manifest":
+                      continue
+                  if not p.get("os") or not p.get("architecture") or "unknown" in (p["os"], p["architecture"]):
+                      continue
+                  parts = [p["os"], p["architecture"]]
+                  if p.get("variant"):
+                      parts.append(p["variant"])
+                  platforms.add("/".join(parts))
+              if not platforms:
+                  raise ValueError(f"No runnable platforms in {source}")
+              flags = [argument for p in sorted(platforms) for argument in ("--platform", p)]
+              crane("index", "filter", source, *flags, "--tag", destination)
+              return ", ".join(sorted(platforms))
 
-            if [ -n "$platform" ]; then
-              os=$(echo "$platform" | cut -d/ -f1)
-              arch=$(echo "$platform" | cut -d/ -f2)
 
-              skopeo copy \
-                --all \
-                --override-os "$os" \
-                --override-arch "$arch" \
-                --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" \
-                "docker://$image" \
-                "docker://$new_image"
-            else
-              skopeo copy \
-                --all \
-                --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" \
-                "docker://$image" \
-                "docker://$new_image"
-            fi
+          def main():
+              required = ("ALIYUN_REGISTRY", "ALIYUN_NAME_SPACE", "ALIYUN_REGISTRY_USER", "ALIYUN_REGISTRY_PASSWORD")
+              for key in required:
+                  if not os.environ.get(key, "").strip():
+                      raise ValueError(f"Missing repository Secret: {key}")
+              registry = os.environ["ALIYUN_REGISTRY"].strip().rstrip("/")
+              namespace = os.environ["ALIYUN_NAME_SPACE"].strip()
+              if "/" in registry or "/" in namespace:
+                  raise ValueError("ALIYUN_REGISTRY must be a hostname; ALIYUN_NAME_SPACE must be one namespace")
+              source = os.environ.get("SOURCE_IMAGE", "").strip()
+              target = os.environ.get("TARGET_IMAGE", "").strip()
+              platform = os.environ.get("IMAGE_PLATFORM", "").strip()
+              if source:
+                  entries = [(source, platform)]
+              else:
+                  if target or platform:
+                      raise ValueError("target_image/platform require source_image")
+                  entries = [entry for line in Path("images.txt").read_text(encoding="utf-8-sig").splitlines()
+                             if (entry := parse_line(line))]
+              plan = make_plan(entries, registry, namespace, target)
+              with tempfile.TemporaryDirectory(prefix="acr-auth-", dir=os.environ["RUNNER_TEMP"]) as config:
+                  os.environ["DOCKER_CONFIG"] = config
+                  source_keys = ("SOURCE_REGISTRY", "SOURCE_USERNAME", "SOURCE_PASSWORD")
+                  if any(os.environ.get(key) for key in source_keys):
+                      if not all(os.environ.get(key) for key in source_keys):
+                          raise ValueError("Private sources require SOURCE_REGISTRY, SOURCE_USERNAME and SOURCE_PASSWORD")
+                      subprocess.run(["crane", "auth", "login", os.environ["SOURCE_REGISTRY"],
+                                      "--username", os.environ["SOURCE_USERNAME"], "--password-stdin"],
+                                     input=os.environ["SOURCE_PASSWORD"], text=True, check=True)
+                  subprocess.run(["crane", "auth", "login", registry, "--username", os.environ["ALIYUN_REGISTRY_USER"],
+                                  "--password-stdin"], input=os.environ["ALIYUN_REGISTRY_PASSWORD"], text=True, check=True)
+                  for image in plan:
+                      platforms = sync_image(image)
+                      with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                          summary.write(f"- `{image['source']}` → `{image['destination']}` ({platforms})\n")
 
-          done < images.txt
+
+          if __name__ == "__main__":
+              main()
